@@ -54,7 +54,7 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 cap.set(cv2.CAP_PROP_FPS, 30)
 
-win_name = "Hand-Tracking (Threads & Fäden)"
+win_name = "Hand-Tracking (Verzerrungs-Effekt)"
 cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -73,7 +73,7 @@ fps_timer  = time.time()
 fps = 0
 fps_count = 0
 
-print("Hand-Tracking (Fäden) läuft... Drücke 'q' zum Beenden.")
+print("Hand-Tracking (Verzerrung) läuft... Drücke 'q' zum Beenden.")
 
 while True:
     success, img = cap.read()
@@ -103,7 +103,7 @@ while True:
     with result_lock:
         result = latest_result
 
-    # ── Hände und Fäden zeichnen ──────────────────────────────────────────────
+    # ── Effekt-Logik ─────────────────────────────────────────────────────────
     nh = 0
     all_hand_pts = []
     
@@ -115,31 +115,48 @@ while True:
             pts   = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
             all_hand_pts.append(pts)
 
-            # Hand-Skelett
+            # Hand-Skelett zeichnen
             for a, b in HAND_CONNECTIONS:
                 cv2.line(img, pts[a], pts[b], color, 2)
             for pt in pts:
-                cv2.circle(img, pt, 5, (255, 255, 255), cv2.FILLED)
-                cv2.circle(img, pt, 5, color, 1)
-            cv2.putText(img, label, (pts[0][0] - 20, pts[0][1] + 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+                cv2.circle(img, pt, 4, (255, 255, 255), cv2.FILLED)
 
-        # Fäden zwischen den Händen zeichnen (wenn 2 Hände da sind)
+        # Verzerrungseffekt zwischen den Händen
         if len(all_hand_pts) == 2:
-            hand1 = all_hand_pts[0]
-            hand2 = all_hand_pts[1]
-            # Ziehe Fäden zwischen entsprechenden Fingerspitzen und Gelenken
-            # Wir nehmen z.B. alle Spitzen (4, 8, 12, 16, 20)
+            pts1 = np.array(all_hand_pts[0])
+            pts2 = np.array(all_hand_pts[1])
+            
+            # Bereich zwischen den Händen definieren (Konvexe Hülle aller Punkte)
+            combined_pts = np.vstack([pts1, pts2])
+            hull = cv2.convexHull(combined_pts)
+            
+            # Maske für den Verzerrungsbereich
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillConvexPoly(mask, hull, 255)
+            
+            # Dynamische Verzerrung (Pixel-Shift)
+            shift_x = int(5 * np.sin(time.time() * 5))
+            shift_y = int(5 * np.cos(time.time() * 5))
+            
+            # Das Bild im Bereich der Maske leicht verschieben (Glass-Effekt)
+            M = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
+            distorted = cv2.warpAffine(img, M, (w, h))
+            
+            # Nur im Maskenbereich das verschobene Bild einblenden
+            mask_bool = mask > 0
+            # Mix aus Original und verschobenem Bild für Transparenz
+            img[mask_bool] = cv2.addWeighted(img[mask_bool], 0.7, distorted[mask_bool], 0.3, 0)
+            
+            # Die Fäden zusätzlich über die Verzerrung zeichnen
             tips = [4, 8, 12, 16, 20]
             for idx in tips:
-                p1 = hand1[idx]
-                p2 = hand2[idx]
-                # Ein dünner, halb-transparenter Effekt (wir nutzen einfach eine dünne Linie)
-                cv2.line(img, p1, p2, (255, 255, 255), 1, cv2.LINE_AA)
-                # Kleine Punkte in der Mitte des Fadens für "Glitzern"
-                mid_x = (p1[0] + p2[0]) // 2
-                mid_y = (p1[1] + p2[1]) // 2
-                cv2.circle(img, (mid_x, mid_y), 2, (255, 255, 200), cv2.FILLED)
+                p1, p2 = pts1[idx], pts2[idx]
+                cv2.line(img, p1, p2, (200, 255, 255), 1, cv2.LINE_AA)
+                # "Energie-Pulse" auf den Fäden
+                pulse_pos = (np.sin(time.time() * 10 + idx) + 1) / 2
+                px = int(p1[0] * (1 - pulse_pos) + p2[0] * pulse_pos)
+                py = int(p1[1] * (1 - pulse_pos) + p2[1] * pulse_pos)
+                cv2.circle(img, (px, py), 3, (255, 255, 255), cv2.FILLED)
 
     # ── Status Banner ────────────────────────────────────────────────────────
     cv2.rectangle(img, (0, 0), (w, 45), (30, 30, 30), cv2.FILLED)
