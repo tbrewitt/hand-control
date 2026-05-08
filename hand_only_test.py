@@ -6,11 +6,74 @@ import time
 import numpy as np
 import threading
 import queue
+import math
+
+# ── OneEuroFilter Klasse zur Glättung ─────────────────────────────────────────
+class OneEuroFilter:
+    def __init__(self, freq, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
+        self.freq = freq
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.x_prev = None
+        self.dx_prev = None
+
+    def _alpha(self, cutoff):
+        tau = 1.0 / (2 * math.pi * cutoff)
+        te = 1.0 / self.freq
+        return 1.0 / (1.0 + tau / te)
+
+    def __call__(self, x, dt):
+        if self.x_prev is None:
+            self.x_prev = x
+            self.dx_prev = 0
+            return x
+        
+        # Ableitung berechnen
+        dx = (x - self.x_prev) / dt
+        a_d = self._alpha(self.d_cutoff)
+        dx_hat = a_d * dx + (1.0 - a_d) * self.dx_prev
+        
+        # Cutoff-Frequenz anpassen
+        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
+        a = self._alpha(cutoff)
+        
+        x_hat = a * x + (1.0 - a) * self.x_prev
+        
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        return x_hat
+
+# Filter für 2 Hände x 21 Punkte x 3 Koordinaten (x,y,z)
+class HandSmoother:
+    def __init__(self):
+        # min_cutoff: kleiner = ruhiger bei langsamer Bewegung
+        # beta: größer = weniger Lag bei schneller Bewegung
+        self.filters = [[OneEuroFilter(30, min_cutoff=0.5, beta=0.01) for _ in range(21*3)] for _ in range(2)]
+        self.active = [False, False]
+
+    def smooth(self, hand_idx, landmarks, dt):
+        self.active[hand_idx] = True
+        smoothed = []
+        for i, lm in enumerate(landmarks):
+            idx = i * 3
+            sx = self.filters[hand_idx][idx](lm.x, dt)
+            sy = self.filters[hand_idx][idx+1](lm.y, dt)
+            sz = self.filters[hand_idx][idx+2](lm.z, dt)
+            # Wir geben ein Objekt zurück, das wie ein MediaPipe Landmark aussieht
+            smoothed.append(type('Landmark', (), {'x': sx, 'y': sy, 'z': sz}))
+        return smoothed
+
+    def reset(self, hand_idx):
+        for f in self.filters[hand_idx]:
+            f.x_prev = None
+        self.active[hand_idx] = False
 
 # ── Shared State ─────────────────────────────────────────────────────────────
 latest_result = None
 result_lock   = threading.Lock()
 frame_queue   = queue.Queue(maxsize=1)
+smoother      = HandSmoother()
 
 class SnapState:
     def __init__(self):
@@ -19,7 +82,6 @@ class SnapState:
         self.last_dist = 0
 
 snap_states = [SnapState(), SnapState()]
-# Wir behalten die Variable, falls wir sie später für Funktionen brauchen
 last_snap_time = 0
 
 # ── MediaPipe Worker Thread ───────────────────────────────────────────────────
@@ -57,7 +119,7 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 cap.set(cv2.CAP_PROP_FPS, 30)
 
-win_name = "Hand-Tracking (Snap Engine Only)"
+win_name = "Hand-Tracking (Smooth & Fast)"
 cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -70,10 +132,16 @@ HAND_CONNECTIONS = [
 
 start_time = time.time()
 fps_timer  = time.time()
+last_frame_time = time.time()
 fps = 0
 fps_count = 0
 
 while True:
+    curr_frame_t = time.time()
+    dt = curr_frame_t - last_frame_time
+    last_frame_time = curr_frame_t
+    if dt <= 0: dt = 0.03
+
     success, img = cap.read()
     if not success: break
     img = cv2.flip(img, 1)
@@ -91,43 +159,49 @@ while True:
 
     with result_lock: result = latest_result
 
-    # ── Effekt & Snap Logik ───────────────────────────────────────────────────
+    # ── Effekt & Smooth Logik ────────────────────────────────────────────────
     all_hand_pts = []
-    curr_t = time.time()
     
     if result and result.hand_landmarks:
-        for i, lms in enumerate(result.hand_landmarks):
-            pts = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
-            all_hand_pts.append(pts)
-            
-            # Snap Detection (Hintergrund-Logik bleibt)
-            hand_size = np.sqrt((lms[0].x - lms[9].x)**2 + (lms[0].y - lms[9].y)**2)
-            dist = np.sqrt((lms[4].x - lms[12].x)**2 + (lms[4].y - lms[12].y)**2)
-            
-            state = snap_states[i]
-            if dist < 0.18 * hand_size:
-                state.is_primed = True
-                state.prime_time = curr_t
-            elif state.is_primed:
-                dist_change = dist - state.last_dist
-                if dist > 0.6 * hand_size and dist_change > 0.1 * hand_size:
-                    if curr_t - state.prime_time < 0.4:
-                        last_snap_time = curr_t # Event getriggert!
-                    state.is_primed = False
-            state.last_dist = dist
-            if state.is_primed and curr_t - state.prime_time > 0.5: state.is_primed = False
+        num_found = len(result.hand_landmarks)
+        for i in range(2):
+            if i < num_found:
+                raw_lms = result.hand_landmarks[i]
+                # Filter anwenden
+                lms = smoother.smooth(i, raw_lms, dt)
+                
+                pts = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
+                all_hand_pts.append(pts)
+                
+                # Snap Detection (mit geglätteten Werten noch stabiler!)
+                hand_size = np.sqrt((lms[0].x - lms[9].x)**2 + (lms[0].y - lms[9].y)**2)
+                dist = np.sqrt((lms[4].x - lms[12].x)**2 + (lms[4].y - lms[12].y)**2)
+                state = snap_states[i]
+                if dist < 0.18 * hand_size:
+                    state.is_primed, state.prime_time = True, curr_frame_t
+                elif state.is_primed:
+                    dist_change = dist - state.last_dist
+                    if dist > 0.6 * hand_size and dist_change > 0.1 * hand_size:
+                        if curr_frame_t - state.prime_time < 0.4: last_snap_time = curr_frame_t
+                        state.is_primed = False
+                state.last_dist = dist
+                if state.is_primed and curr_frame_t - state.prime_time > 0.5: state.is_primed = False
 
-            color = HAND_COLORS.get(result.handedness[i][0].display_name if result.handedness else "?", (200, 200, 200))
-            for a, b in HAND_CONNECTIONS: cv2.line(img, pts[a], pts[b], color, 2)
-            for pt in pts: cv2.circle(img, pt, 4, (255, 255, 255), cv2.FILLED)
+                color = HAND_COLORS.get(result.handedness[i][0].display_name if result.handedness else "?", (200, 200, 200))
+                for a, b in HAND_CONNECTIONS: cv2.line(img, pts[a], pts[b], color, 2)
+                for pt in pts: cv2.circle(img, pt, 4, (255, 255, 255), cv2.FILLED)
+            else:
+                # Hand verloren -> Filter zurücksetzen
+                smoother.reset(i)
 
-        # Heat-Haze Segmente (ROI-basiert)
+        # Segmentierter Heat Haze
         if len(all_hand_pts) == 2:
             pts1, pts2 = np.array(all_hand_pts[0]), np.array(all_hand_pts[1])
             tips_idx = [4, 8, 12, 16, 20]
             all_tips = []
             for j in range(len(tips_idx)-1):
                 all_tips.extend([pts1[tips_idx[j]], pts2[tips_idx[j]], pts2[tips_idx[j+1]], pts1[tips_idx[j+1]]])
+            
             x, y, bw, bh = cv2.boundingRect(np.array(all_tips, dtype=np.int32))
             x, y, bw, bh = max(0, x-15), max(0, y-15), min(w-x, bw+30), min(h-y, bh+30)
 
@@ -139,6 +213,7 @@ while True:
                     offset = int(14 * np.sin(2 * np.pi * (r+y) / 25 + t_wave))
                     distorted_roi[r] = np.roll(roi[r], offset, axis=0)
                 distorted_roi = cv2.GaussianBlur(distorted_roi, (7, 7), 0)
+                
                 mask_roi = np.zeros((bh, bw), dtype=np.uint8)
                 for j in range(len(tips_idx) - 1):
                     idx_a, idx_b = tips_idx[j], tips_idx[j+1]
@@ -150,9 +225,9 @@ while True:
                 img[y:y+bh, x:x+bw] = ((1.0 - alpha) * img[y:y+bh, x:x+bw].astype(float) + alpha * distorted_roi.astype(float)).astype(np.uint8)
             for idx in tips_idx: cv2.line(img, tuple(pts1[idx]), tuple(pts2[idx]), (240, 255, 255), 1, cv2.LINE_AA)
 
-    # ── Status ──
+    # UI
     cv2.rectangle(img, (0, 0), (w, 45), (30, 30, 30), cv2.FILLED)
-    cv2.putText(img, f"Haende: {len(all_hand_pts)}/2   FPS: {fps}", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    cv2.putText(img, f"Haende: {len(all_hand_pts)}/2   FPS: {fps}   SMOOTHING: ON", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
     cv2.imshow(win_name, img)
     if cv2.waitKey(1) & 0xFF == ord('q'): break
 
