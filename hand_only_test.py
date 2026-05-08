@@ -12,9 +12,10 @@ latest_result = None
 result_lock   = threading.Lock()
 frame_queue   = queue.Queue(maxsize=1)
 
+# Status Variablen
 hand_primed = [False, False]
 last_prime_time = [0, 0]
-last_snap_time = 0
+heat_haze_enabled = True # Startwert
 
 # ── MediaPipe Worker Thread ───────────────────────────────────────────────────
 hand_options = vision.HandLandmarkerOptions(
@@ -51,7 +52,7 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH,  320)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 cap.set(cv2.CAP_PROP_FPS, 30)
 
-win_name = "Hand-Tracking (Thinner & Hotter)"
+win_name = "Hand-Tracking (Snap Toggle)"
 cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -85,38 +86,34 @@ while True:
 
     with result_lock: result = latest_result
 
-    # ── Effekt & Snap Logik ───────────────────────────────────────────────────
+    # ── Logik & Toggle ───────────────────────────────────────────────────────
     all_hand_pts = []
     curr_t = time.time()
     
     if result and result.hand_landmarks:
-        # Erstelle ein Overlay für dünnere, semi-transparente Linien
         overlay = img.copy()
-        
         for i, lms in enumerate(result.hand_landmarks):
             pts = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
             all_hand_pts.append(pts)
             
-            # Snap Detection
+            # Snap Detection -> Toggle Heat Haze
             hand_size = np.sqrt((lms[0].x - lms[9].x)**2 + (lms[0].y - lms[9].y)**2)
             dist = np.sqrt((lms[4].x - lms[12].x)**2 + (lms[4].y - lms[12].y)**2)
             if dist < 0.18 * hand_size:
                 hand_primed[i], last_prime_time[i] = True, curr_t
             elif hand_primed[i] and dist > 0.6 * hand_size:
-                if curr_t - last_prime_time[i] < 0.4: last_snap_time = curr_t
+                if curr_t - last_prime_time[i] < 0.4:
+                    heat_haze_enabled = not heat_haze_enabled # TOGGLE!
                 hand_primed[i] = False
             if hand_primed[i] and curr_t - last_prime_time[i] > 0.5: hand_primed[i] = False
 
-            # Dünnere Markierungen (Thickness 1, Radius 1)
             color = HAND_COLORS.get(result.handedness[i][0].display_name if result.handedness else "?", (200, 200, 200))
             for a, b in HAND_CONNECTIONS: cv2.line(overlay, pts[a], pts[b], color, 1)
             for pt in pts: cv2.circle(overlay, pt, 1, (255, 255, 255), cv2.FILLED)
-        
-        # Blende Skelett leicht ein (dezenter)
         cv2.addWeighted(overlay, 0.7, img, 0.3, 0, img)
 
-        # Segmentierter Heat Haze (STÄRKER!)
-        if len(all_hand_pts) == 2:
+        # Segmentierter Heat Haze (Nur wenn enabled!)
+        if heat_haze_enabled and len(all_hand_pts) == 2:
             pts1, pts2 = np.array(all_hand_pts[0]), np.array(all_hand_pts[1])
             tips_idx = [4, 8, 12, 16, 20]
             all_tips = []
@@ -124,37 +121,31 @@ while True:
                 all_tips.extend([pts1[tips_idx[j]], pts2[tips_idx[j]], pts2[tips_idx[j+1]], pts1[tips_idx[j+1]]])
             x, y, bw, bh = cv2.boundingRect(np.array(all_tips, dtype=np.int32))
             x, y, bw, bh = max(0, x-15), max(0, y-15), min(w-x, bw+30), min(h-y, bh+30)
-
             if bw > 5 and bh > 5:
                 roi = img[y:y+bh, x:x+bw].copy()
                 distorted_roi = roi.copy()
-                t_wave = time.time() * 30 # Schnelleres Flimmern
+                t_wave = time.time() * 30
                 for r in range(bh):
-                    # Stärkerer Offset (16 statt 8) und höhere Frequenz
                     offset = int(16 * np.sin(2 * np.pi * (r+y) / 12 + t_wave))
                     distorted_roi[r] = np.roll(roi[r], offset, axis=0)
-                
-                # Mehr Unschärfe für den "Hitzeluft"-Look
                 distorted_roi = cv2.GaussianBlur(distorted_roi, (9, 9), 0)
-                
                 mask_roi = np.zeros((bh, bw), dtype=np.uint8)
                 for j in range(len(tips_idx) - 1):
                     idx_a, idx_b = tips_idx[j], tips_idx[j+1]
                     quad = np.array([pts1[idx_a], pts2[idx_a], pts2[idx_b], pts1[idx_b]], dtype=np.int32) - [x, y]
                     cv2.fillPoly(mask_roi, [quad], 255)
                 mask_roi = cv2.GaussianBlur(mask_roi, (11, 11), 0)
-                
-                alpha = (mask_roi.astype(float) / 255.0) * 0.9 # Etwas deckender
+                alpha = (mask_roi.astype(float) / 255.0) * 0.9
                 alpha = cv2.merge([alpha, alpha, alpha])
                 img[y:y+bh, x:x+bw] = ((1.0 - alpha) * img[y:y+bh, x:x+bw].astype(float) + alpha * distorted_roi.astype(float)).astype(np.uint8)
-            
-            # Fäden (Extra dünn)
-            for idx in tips_idx:
-                cv2.line(img, tuple(pts1[idx]), tuple(pts2[idx]), (240, 255, 255), 1, cv2.LINE_AA)
+            for idx in tips_idx: cv2.line(img, tuple(pts1[idx]), tuple(pts2[idx]), (240, 255, 255), 1, cv2.LINE_AA)
 
-    # UI
+    # UI Banner
+    status_color = (0, 255, 0) if heat_haze_enabled else (0, 0, 255)
     cv2.rectangle(img, (0, 0), (w, 30), (30, 30, 30), cv2.FILLED)
-    cv2.putText(img, f"Haende: {len(all_hand_pts)}/2   FPS: {fps}", (5, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    cv2.putText(img, f"FPS: {fps}   HEAT: {'ON' if heat_haze_enabled else 'OFF'}", (5, 22), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 1)
+    
     cv2.imshow(win_name, img)
     if cv2.waitKey(1) & 0xFF == ord('q'): break
 
