@@ -12,9 +12,15 @@ latest_result = None
 result_lock   = threading.Lock()
 frame_queue   = queue.Queue(maxsize=1)
 
-# Schnips-Logik State
-hand_primed = [False, False]
-last_prime_time = [0, 0]
+# Verbesserter Schnips-State pro Hand (bis zu 2 Hände)
+class SnapState:
+    def __init__(self):
+        self.is_primed = False
+        self.prime_time = 0
+        self.last_dist = 0
+        self.history = [] # Speichert Abstände der letzten Frames
+
+snap_states = [SnapState(), SnapState()]
 snap_display_until = 0
 
 # ── MediaPipe Worker Thread ───────────────────────────────────────────────────
@@ -52,7 +58,7 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 cap.set(cv2.CAP_PROP_FPS, 30)
 
-win_name = "Hand-Tracking (Optimized Snap & Heat)"
+win_name = "Hand-Tracking (Pro Snap Detection)"
 cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -86,35 +92,50 @@ while True:
 
     with result_lock: result = latest_result
 
-    # ── Effekt-Logik ─────────────────────────────────────────────────────────
+    # ── Effekt & Pro Snap Logik ─────────────────────────────────────────────
     all_hand_pts = []
+    curr_t = time.time()
+    
     if result and result.hand_landmarks:
         for i, lms in enumerate(result.hand_landmarks):
-            label = result.handedness[i][0].display_name if result.handedness else "?"
-            color = HAND_COLORS.get(label, (200, 200, 200))
-            pts   = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
             all_hand_pts.append(pts)
             
-            # Snap Detection
+            # Referenzgröße der Hand (Handgelenk zu Mittelfinger-MCP)
+            hand_size = np.sqrt((lms[0].x - lms[9].x)**2 + (lms[0].y - lms[9].y)**2)
+            # Abstand Daumen-Spitze zu Mittelfinger-Spitze
             dist = np.sqrt((lms[4].x - lms[12].x)**2 + (lms[4].y - lms[12].y)**2)
-            curr_t = time.time()
-            if dist < 0.04:
-                hand_primed[i], last_prime_time[i] = True, curr_t
-            elif hand_primed[i] and dist > 0.12:
-                if curr_t - last_prime_time[i] < 0.5: snap_display_until = curr_t + 1.0
-                hand_primed[i] = False
-            if hand_primed[i] and curr_t - last_prime_time[i] > 0.6: hand_primed[i] = False
+            
+            state = snap_states[i]
+            # 1. Priming (Geste vorbereiten)
+            if dist < 0.18 * hand_size:
+                state.is_primed = True
+                state.prime_time = curr_t
+            # 2. Trigger (Schnelles Lösen)
+            elif state.is_primed:
+                # Schnelligkeits-Check: Abstand muss schlagartig wachsen
+                # Und Mittelfinger muss sich Richtung Handfläche bewegen
+                dist_change = dist - state.last_dist
+                if dist > 0.6 * hand_size and dist_change > 0.1 * hand_size:
+                    if curr_t - state.prime_time < 0.4:
+                        snap_display_until = curr_t + 1.2
+                    state.is_primed = False
+            
+            state.last_dist = dist
+            # Auto-Reset Prime-State
+            if state.is_primed and curr_t - state.prime_time > 0.5:
+                state.is_primed = False
 
-            # Skelett
+            # Skelett zeichnen
+            label = result.handedness[i][0].display_name if result.handedness else "?"
+            color = HAND_COLORS.get(label, (200, 200, 200))
             for a, b in HAND_CONNECTIONS: cv2.line(img, pts[a], pts[b], color, 2)
             for pt in pts: cv2.circle(img, pt, 4, (255, 255, 255), cv2.FILLED)
 
-        # ROI-basierter Heat Haze (Segmentiert)
+        # Heat-Haze Segmente (ROI-basiert)
         if len(all_hand_pts) == 2:
             pts1, pts2 = np.array(all_hand_pts[0]), np.array(all_hand_pts[1])
             tips_idx = [4, 8, 12, 16, 20]
-            
-            # Bounding Box um Finger-Segmente
             all_tips = []
             for j in range(len(tips_idx)-1):
                 all_tips.extend([pts1[tips_idx[j]], pts2[tips_idx[j]], pts2[tips_idx[j+1]], pts1[tips_idx[j+1]]])
@@ -125,7 +146,6 @@ while True:
 
             if bw > 10 and bh > 10:
                 roi = img[y:y+bh, x:x+bw].copy()
-                # Den alten "aggressiven" Look mit np.roll herstellen (aber nur im ROI!)
                 distorted_roi = roi.copy()
                 t_wave = time.time() * 25
                 for r in range(bh):
@@ -133,7 +153,6 @@ while True:
                     distorted_roi[r] = np.roll(roi[r], offset, axis=0)
                 distorted_roi = cv2.GaussianBlur(distorted_roi, (7, 7), 0)
 
-                # Segment-Maske für ROI
                 mask_roi = np.zeros((bh, bw), dtype=np.uint8)
                 for j in range(len(tips_idx) - 1):
                     idx_a, idx_b = tips_idx[j], tips_idx[j+1]
@@ -145,13 +164,13 @@ while True:
                 alpha = cv2.merge([alpha, alpha, alpha])
                 img[y:y+bh, x:x+bw] = ((1.0 - alpha) * img[y:y+bh, x:x+bw].astype(float) + alpha * distorted_roi.astype(float)).astype(np.uint8)
 
-            # Fäden
             for idx in tips_idx: cv2.line(img, tuple(pts1[idx]), tuple(pts2[idx]), (240, 255, 255), 1, cv2.LINE_AA)
 
-    # UI
+    # ── UI ──
     if time.time() < snap_display_until:
-        cv2.putText(img, "SNAP!", (w-250, 100), cv2.FONT_HERSHEY_TRIPLEX, 2.0, (0, 0, 0), 6)
-        cv2.putText(img, "SNAP!", (w-254, 96), cv2.FONT_HERSHEY_TRIPLEX, 2.0, (0, 220, 255), 4)
+        # Helleres, moderneres UI für SNAP
+        cv2.putText(img, "SNAP!", (w-260, 110), cv2.FONT_HERSHEY_TRIPLEX, 2.2, (255, 255, 255), 10)
+        cv2.putText(img, "SNAP!", (w-260, 110), cv2.FONT_HERSHEY_TRIPLEX, 2.2, (0, 165, 255), 4)
 
     cv2.rectangle(img, (0, 0), (w, 45), (30, 30, 30), cv2.FILLED)
     cv2.putText(img, f"Haende: {len(all_hand_pts)}/2   FPS: {fps}", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
