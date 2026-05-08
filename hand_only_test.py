@@ -12,11 +12,6 @@ latest_result = None
 result_lock   = threading.Lock()
 frame_queue   = queue.Queue(maxsize=1)
 
-def hand_result_callback(result, output_image, timestamp_ms):
-    global latest_result
-    with result_lock:
-        latest_result = result
-
 # ── MediaPipe Worker Thread ───────────────────────────────────────────────────
 hand_options = vision.HandLandmarkerOptions(
     base_options=python.BaseOptions(model_asset_path='hand_landmarker.task'),
@@ -59,8 +54,7 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 cap.set(cv2.CAP_PROP_FPS, 30)
 
-# Window Setup für Fullscreen
-win_name = "Hand-Tracking (threaded)"
+win_name = "Hand-Tracking (Threads & Fäden)"
 cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -79,7 +73,7 @@ fps_timer  = time.time()
 fps = 0
 fps_count = 0
 
-print("Hand-Tracking (Fullscreen) läuft... Drücke 'q' zum Beenden.")
+print("Hand-Tracking (Fäden) läuft... Drücke 'q' zum Beenden.")
 
 while True:
     success, img = cap.read()
@@ -109,15 +103,19 @@ while True:
     with result_lock:
         result = latest_result
 
-    # ── Hände zeichnen ───────────────────────────────────────────────────────
+    # ── Hände und Fäden zeichnen ──────────────────────────────────────────────
     nh = 0
+    all_hand_pts = []
+    
     if result and result.hand_landmarks:
         nh = len(result.hand_landmarks)
         for i, lms in enumerate(result.hand_landmarks):
             label = result.handedness[i][0].display_name if result.handedness else "?"
             color = HAND_COLORS.get(label, (200, 200, 200))
             pts   = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
+            all_hand_pts.append(pts)
 
+            # Hand-Skelett
             for a, b in HAND_CONNECTIONS:
                 cv2.line(img, pts[a], pts[b], color, 2)
             for pt in pts:
@@ -125,6 +123,23 @@ while True:
                 cv2.circle(img, pt, 5, color, 1)
             cv2.putText(img, label, (pts[0][0] - 20, pts[0][1] + 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+
+        # Fäden zwischen den Händen zeichnen (wenn 2 Hände da sind)
+        if len(all_hand_pts) == 2:
+            hand1 = all_hand_pts[0]
+            hand2 = all_hand_pts[1]
+            # Ziehe Fäden zwischen entsprechenden Fingerspitzen und Gelenken
+            # Wir nehmen z.B. alle Spitzen (4, 8, 12, 16, 20)
+            tips = [4, 8, 12, 16, 20]
+            for idx in tips:
+                p1 = hand1[idx]
+                p2 = hand2[idx]
+                # Ein dünner, halb-transparenter Effekt (wir nutzen einfach eine dünne Linie)
+                cv2.line(img, p1, p2, (255, 255, 255), 1, cv2.LINE_AA)
+                # Kleine Punkte in der Mitte des Fadens für "Glitzern"
+                mid_x = (p1[0] + p2[0]) // 2
+                mid_y = (p1[1] + p2[1]) // 2
+                cv2.circle(img, (mid_x, mid_y), 2, (255, 255, 200), cv2.FILLED)
 
     # ── Status Banner ────────────────────────────────────────────────────────
     cv2.rectangle(img, (0, 0), (w, 45), (30, 30, 30), cv2.FILLED)
