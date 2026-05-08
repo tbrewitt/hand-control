@@ -19,9 +19,8 @@ class SnapState:
         self.last_dist = 0
 
 snap_states = [SnapState(), SnapState()]
-snap_display_until = 0
-flash_until = 0
-flash_pos = (0, 0)
+# Wir behalten die Variable, falls wir sie später für Funktionen brauchen
+last_snap_time = 0
 
 # ── MediaPipe Worker Thread ───────────────────────────────────────────────────
 hand_options = vision.HandLandmarkerOptions(
@@ -58,7 +57,7 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 cap.set(cv2.CAP_PROP_FPS, 30)
 
-win_name = "Hand-Tracking (Snap & Flash)"
+win_name = "Hand-Tracking (Snap Engine Only)"
 cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -101,6 +100,7 @@ while True:
             pts = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
             all_hand_pts.append(pts)
             
+            # Snap Detection (Hintergrund-Logik bleibt)
             hand_size = np.sqrt((lms[0].x - lms[9].x)**2 + (lms[0].y - lms[9].y)**2)
             dist = np.sqrt((lms[4].x - lms[12].x)**2 + (lms[4].y - lms[12].y)**2)
             
@@ -112,9 +112,7 @@ while True:
                 dist_change = dist - state.last_dist
                 if dist > 0.6 * hand_size and dist_change > 0.1 * hand_size:
                     if curr_t - state.prime_time < 0.4:
-                        snap_display_until = curr_t + 1.0
-                        flash_until = curr_t + 0.15 # Kurzer Blitz
-                        flash_pos = pts[12] # Blitz am Mittelfinger
+                        last_snap_time = curr_t # Event getriggert!
                     state.is_primed = False
             state.last_dist = dist
             if state.is_primed and curr_t - state.prime_time > 0.5: state.is_primed = False
@@ -123,6 +121,7 @@ while True:
             for a, b in HAND_CONNECTIONS: cv2.line(img, pts[a], pts[b], color, 2)
             for pt in pts: cv2.circle(img, pt, 4, (255, 255, 255), cv2.FILLED)
 
+        # Heat-Haze Segmente (ROI-basiert)
         if len(all_hand_pts) == 2:
             pts1, pts2 = np.array(all_hand_pts[0]), np.array(all_hand_pts[1])
             tips_idx = [4, 8, 12, 16, 20]
@@ -130,8 +129,8 @@ while True:
             for j in range(len(tips_idx)-1):
                 all_tips.extend([pts1[tips_idx[j]], pts2[tips_idx[j]], pts2[tips_idx[j+1]], pts1[tips_idx[j+1]]])
             x, y, bw, bh = cv2.boundingRect(np.array(all_tips, dtype=np.int32))
-            x, y = max(0, x-15), max(0, y-15)
-            bw, bh = min(w - x, bw+30), min(h - y, bh+30)
+            x, y, bw, bh = max(0, x-15), max(0, y-15), min(w-x, bw+30), min(h-y, bh+30)
+
             if bw > 10 and bh > 10:
                 roi = img[y:y+bh, x:x+bw].copy()
                 distorted_roi = roi.copy()
@@ -151,18 +150,7 @@ while True:
                 img[y:y+bh, x:x+bw] = ((1.0 - alpha) * img[y:y+bh, x:x+bw].astype(float) + alpha * distorted_roi.astype(float)).astype(np.uint8)
             for idx in tips_idx: cv2.line(img, tuple(pts1[idx]), tuple(pts2[idx]), (240, 255, 255), 1, cv2.LINE_AA)
 
-    # ── Blitz Effekt ──
-    if curr_t < flash_until:
-        # 1. Lokaler weißer Kreis (Blitz)
-        cv2.circle(img, flash_pos, 60, (255, 255, 255), -1)
-        # 2. Globaler Helligkeits-Boost
-        img = cv2.add(img, np.array([60, 60, 60], dtype=np.uint8))
-
-    # ── UI ──
-    if curr_t < snap_display_until:
-        cv2.putText(img, "SNAP!", (w-260, 110), cv2.FONT_HERSHEY_TRIPLEX, 2.2, (255, 255, 255), 10)
-        cv2.putText(img, "SNAP!", (w-260, 110), cv2.FONT_HERSHEY_TRIPLEX, 2.2, (0, 165, 255), 4)
-
+    # ── Status ──
     cv2.rectangle(img, (0, 0), (w, 45), (30, 30, 30), cv2.FILLED)
     cv2.putText(img, f"Haende: {len(all_hand_pts)}/2   FPS: {fps}", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
     cv2.imshow(win_name, img)
