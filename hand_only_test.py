@@ -8,9 +8,9 @@ import threading
 import queue
 import math
 
-# ── OneEuroFilter Klasse zur Glättung ─────────────────────────────────────────
+# ── OneEuroFilter Klasse (Optimiert für weniger Lag) ──────────────────────────
 class OneEuroFilter:
-    def __init__(self, freq, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
+    def __init__(self, freq, min_cutoff=1.5, beta=0.05, d_cutoff=1.0):
         self.freq = freq
         self.min_cutoff = min_cutoff
         self.beta = beta
@@ -29,27 +29,22 @@ class OneEuroFilter:
             self.dx_prev = 0
             return x
         
-        # Ableitung berechnen
         dx = (x - self.x_prev) / dt
         a_d = self._alpha(self.d_cutoff)
         dx_hat = a_d * dx + (1.0 - a_d) * self.dx_prev
         
-        # Cutoff-Frequenz anpassen
         cutoff = self.min_cutoff + self.beta * abs(dx_hat)
         a = self._alpha(cutoff)
-        
         x_hat = a * x + (1.0 - a) * self.x_prev
         
         self.x_prev = x_hat
         self.dx_prev = dx_hat
         return x_hat
 
-# Filter für 2 Hände x 21 Punkte x 3 Koordinaten (x,y,z)
 class HandSmoother:
     def __init__(self):
-        # min_cutoff: kleiner = ruhiger bei langsamer Bewegung
-        # beta: größer = weniger Lag bei schneller Bewegung
-        self.filters = [[OneEuroFilter(30, min_cutoff=0.5, beta=0.01) for _ in range(21*3)] for _ in range(2)]
+        # Höhere Startwerte für min_cutoff und beta -> Weniger Geister-Effekt
+        self.filters = [[OneEuroFilter(30, min_cutoff=1.5, beta=0.05) for _ in range(21*3)] for _ in range(2)]
         self.active = [False, False]
 
     def smooth(self, hand_idx, landmarks, dt):
@@ -60,7 +55,6 @@ class HandSmoother:
             sx = self.filters[hand_idx][idx](lm.x, dt)
             sy = self.filters[hand_idx][idx+1](lm.y, dt)
             sz = self.filters[hand_idx][idx+2](lm.z, dt)
-            # Wir geben ein Objekt zurück, das wie ein MediaPipe Landmark aussieht
             smoothed.append(type('Landmark', (), {'x': sx, 'y': sy, 'z': sz}))
         return smoothed
 
@@ -119,7 +113,7 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 cap.set(cv2.CAP_PROP_FPS, 30)
 
-win_name = "Hand-Tracking (Smooth & Fast)"
+win_name = "Hand-Tracking (Fast Smoothing)"
 cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -161,19 +155,15 @@ while True:
 
     # ── Effekt & Smooth Logik ────────────────────────────────────────────────
     all_hand_pts = []
-    
     if result and result.hand_landmarks:
         num_found = len(result.hand_landmarks)
         for i in range(2):
             if i < num_found:
                 raw_lms = result.hand_landmarks[i]
-                # Filter anwenden
                 lms = smoother.smooth(i, raw_lms, dt)
-                
                 pts = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
                 all_hand_pts.append(pts)
                 
-                # Snap Detection (mit geglätteten Werten noch stabiler!)
                 hand_size = np.sqrt((lms[0].x - lms[9].x)**2 + (lms[0].y - lms[9].y)**2)
                 dist = np.sqrt((lms[4].x - lms[12].x)**2 + (lms[4].y - lms[12].y)**2)
                 state = snap_states[i]
@@ -191,20 +181,16 @@ while True:
                 for a, b in HAND_CONNECTIONS: cv2.line(img, pts[a], pts[b], color, 2)
                 for pt in pts: cv2.circle(img, pt, 4, (255, 255, 255), cv2.FILLED)
             else:
-                # Hand verloren -> Filter zurücksetzen
                 smoother.reset(i)
 
-        # Segmentierter Heat Haze
         if len(all_hand_pts) == 2:
             pts1, pts2 = np.array(all_hand_pts[0]), np.array(all_hand_pts[1])
             tips_idx = [4, 8, 12, 16, 20]
             all_tips = []
             for j in range(len(tips_idx)-1):
                 all_tips.extend([pts1[tips_idx[j]], pts2[tips_idx[j]], pts2[tips_idx[j+1]], pts1[tips_idx[j+1]]])
-            
             x, y, bw, bh = cv2.boundingRect(np.array(all_tips, dtype=np.int32))
             x, y, bw, bh = max(0, x-15), max(0, y-15), min(w-x, bw+30), min(h-y, bh+30)
-
             if bw > 10 and bh > 10:
                 roi = img[y:y+bh, x:x+bw].copy()
                 distorted_roi = roi.copy()
@@ -213,7 +199,6 @@ while True:
                     offset = int(14 * np.sin(2 * np.pi * (r+y) / 25 + t_wave))
                     distorted_roi[r] = np.roll(roi[r], offset, axis=0)
                 distorted_roi = cv2.GaussianBlur(distorted_roi, (7, 7), 0)
-                
                 mask_roi = np.zeros((bh, bw), dtype=np.uint8)
                 for j in range(len(tips_idx) - 1):
                     idx_a, idx_b = tips_idx[j], tips_idx[j+1]
@@ -227,7 +212,7 @@ while True:
 
     # UI
     cv2.rectangle(img, (0, 0), (w, 45), (30, 30, 30), cv2.FILLED)
-    cv2.putText(img, f"Haende: {len(all_hand_pts)}/2   FPS: {fps}   SMOOTHING: ON", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    cv2.putText(img, f"Haende: {len(all_hand_pts)}/2   FPS: {fps}   REACTIVE SMOOTHING: ON", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
     cv2.imshow(win_name, img)
     if cv2.waitKey(1) & 0xFF == ord('q'): break
 
