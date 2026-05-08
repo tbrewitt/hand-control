@@ -12,7 +12,6 @@ latest_result = None
 result_lock   = threading.Lock()
 frame_queue   = queue.Queue(maxsize=1)
 
-# Schnips-Logik State (jetzt wieder ohne Smoother-Objekte)
 hand_primed = [False, False]
 last_prime_time = [0, 0]
 last_snap_time = 0
@@ -46,13 +45,13 @@ def inference_worker():
 worker = threading.Thread(target=inference_worker, daemon=True)
 worker.start()
 
-# ── Webcam ───────────────────────────────────────────────────────────────────
+# ── Webcam (Reduzierte Auflösung für Speed) ──────────────────────────────────
 cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  320) # Reduziert von 640
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240) # Reduziert von 480
 cap.set(cv2.CAP_PROP_FPS, 30)
 
-win_name = "Hand-Tracking (Raw Speed)"
+win_name = "Hand-Tracking (Ultra Fast 240p)"
 cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -95,7 +94,6 @@ while True:
             pts = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
             all_hand_pts.append(pts)
             
-            # Snap Detection (Skaliert auf Handgröße)
             hand_size = np.sqrt((lms[0].x - lms[9].x)**2 + (lms[0].y - lms[9].y)**2)
             dist = np.sqrt((lms[4].x - lms[12].x)**2 + (lms[4].y - lms[12].y)**2)
             if dist < 0.18 * hand_size:
@@ -105,12 +103,11 @@ while True:
                 hand_primed[i] = False
             if hand_primed[i] and curr_t - last_prime_time[i] > 0.5: hand_primed[i] = False
 
-            # Zeichnen
             color = HAND_COLORS.get(result.handedness[i][0].display_name if result.handedness else "?", (200, 200, 200))
-            for a, b in HAND_CONNECTIONS: cv2.line(img, pts[a], pts[b], color, 2)
-            for pt in pts: cv2.circle(img, pt, 4, (255, 255, 255), cv2.FILLED)
+            for a, b in HAND_CONNECTIONS: cv2.line(img, pts[a], pts[b], color, 1) # Dünnere Linien für 240p
+            for pt in pts: cv2.circle(img, pt, 2, (255, 255, 255), cv2.FILLED)
 
-        # Segmentierter Heat Haze
+        # Segmentierter Heat Haze (ROI-basiert)
         if len(all_hand_pts) == 2:
             pts1, pts2 = np.array(all_hand_pts[0]), np.array(all_hand_pts[1])
             tips_idx = [4, 8, 12, 16, 20]
@@ -118,29 +115,29 @@ while True:
             for j in range(len(tips_idx)-1):
                 all_tips.extend([pts1[tips_idx[j]], pts2[tips_idx[j]], pts2[tips_idx[j+1]], pts1[tips_idx[j+1]]])
             x, y, bw, bh = cv2.boundingRect(np.array(all_tips, dtype=np.int32))
-            x, y, bw, bh = max(0, x-15), max(0, y-15), min(w-x, bw+30), min(h-y, bh+30)
-            if bw > 10 and bh > 10:
+            x, y, bw, bh = max(0, x-10), max(0, y-10), min(w-x, bw+20), min(h-y, bh+20)
+            if bw > 5 and bh > 5:
                 roi = img[y:y+bh, x:x+bw].copy()
                 distorted_roi = roi.copy()
                 t_wave = time.time() * 25
                 for r in range(bh):
-                    offset = int(14 * np.sin(2 * np.pi * (r+y) / 25 + t_wave))
+                    offset = int(8 * np.sin(2 * np.pi * (r+y) / 15 + t_wave)) # Angepasst für 240p
                     distorted_roi[r] = np.roll(roi[r], offset, axis=0)
-                distorted_roi = cv2.GaussianBlur(distorted_roi, (7, 7), 0)
+                distorted_roi = cv2.GaussianBlur(distorted_roi, (5, 5), 0)
                 mask_roi = np.zeros((bh, bw), dtype=np.uint8)
                 for j in range(len(tips_idx) - 1):
                     idx_a, idx_b = tips_idx[j], tips_idx[j+1]
                     quad = np.array([pts1[idx_a], pts2[idx_a], pts2[idx_b], pts1[idx_b]], dtype=np.int32) - [x, y]
                     cv2.fillPoly(mask_roi, [quad], 255)
-                mask_roi = cv2.GaussianBlur(mask_roi, (13, 13), 0)
+                mask_roi = cv2.GaussianBlur(mask_roi, (7, 7), 0)
                 alpha = (mask_roi.astype(float) / 255.0) * 0.85
                 alpha = cv2.merge([alpha, alpha, alpha])
                 img[y:y+bh, x:x+bw] = ((1.0 - alpha) * img[y:y+bh, x:x+bw].astype(float) + alpha * distorted_roi.astype(float)).astype(np.uint8)
             for idx in tips_idx: cv2.line(img, tuple(pts1[idx]), tuple(pts2[idx]), (240, 255, 255), 1, cv2.LINE_AA)
 
     # UI
-    cv2.rectangle(img, (0, 0), (w, 45), (30, 30, 30), cv2.FILLED)
-    cv2.putText(img, f"Haende: {len(all_hand_pts)}/2   FPS: {fps}   SMOOTHING: OFF", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    cv2.rectangle(img, (0, 0), (w, 30), (30, 30, 30), cv2.FILLED)
+    cv2.putText(img, f"Haende: {len(all_hand_pts)}/2   FPS: {fps} (240p)", (5, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
     cv2.imshow(win_name, img)
     if cv2.waitKey(1) & 0xFF == ord('q'): break
 
