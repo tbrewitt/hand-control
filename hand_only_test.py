@@ -47,7 +47,7 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 cap.set(cv2.CAP_PROP_FPS, 30)
 
-win_name = "Hand-Tracking (Faden-Hitze)"
+win_name = "Hand-Tracking (Segmented Heat)"
 cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -91,48 +91,41 @@ while True:
             color = HAND_COLORS.get(label, (200, 200, 200))
             pts   = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
             all_hand_pts.append(pts)
-            # Skelett
             for a, b in HAND_CONNECTIONS: cv2.line(img, pts[a], pts[b], color, 2)
             for pt in pts: cv2.circle(img, pt, 4, (255, 255, 255), cv2.FILLED)
 
         if len(all_hand_pts) == 2:
             pts1, pts2 = np.array(all_hand_pts[0]), np.array(all_hand_pts[1])
-            
-            # 1. Nur den Bereich zwischen den Fingerspitzen (4,8,12,16,20) maskieren
             tips_idx = [4, 8, 12, 16, 20]
-            # Polygon: [H1-Tip4...H1-Tip20, H2-Tip20...H2-Tip4]
-            poly_pts = np.vstack([pts1[tips_idx], pts2[tips_idx][::-1]])
             
-            x, y, bw, bh = cv2.boundingRect(poly_pts)
-            x, y = max(0, x), max(0, y)
-            bw, bh = min(w - x, bw), min(h - y, bh)
+            # 1. Globale Verzerrung vorbereiten (Noise/Waves)
+            distorted = img.copy()
+            t = time.time() * 25
+            for i in range(h):
+                off = int(14 * np.sin(2 * np.pi * i / 20 + t))
+                distorted[i] = np.roll(distorted[i], off, axis=0)
+            distorted = cv2.GaussianBlur(distorted, (9, 9), 0)
+
+            # 2. Segment-Maske erstellen (4 separate Vierecke zwischen den Fingern)
+            mask = np.zeros((h, w), dtype=np.uint8)
+            for j in range(len(tips_idx) - 1):
+                idx_a, idx_b = tips_idx[j], tips_idx[j+1]
+                # Viereck zwischen Finger j und j+1 beider Hände
+                quad = np.array([pts1[idx_a], pts2[idx_a], pts2[idx_b], pts1[idx_b]], dtype=np.int32)
+                cv2.fillPoly(mask, [quad], 255)
             
-            if bw > 10 and bh > 10:
-                roi = img[y:y+bh, x:x+bw].copy()
-                distorted_roi = roi.copy()
-                t = time.time() * 20
-                for i in range(bh):
-                    offset = int(12 * np.sin(2 * np.pi * i / 25 + t))
-                    distorted_roi[i] = np.roll(roi[i], offset, axis=0)
-                
-                distorted_roi = cv2.GaussianBlur(distorted_roi, (9, 9), 0)
-                
-                # Maske nur für den "Zwischenraum" der Fäden
-                roi_mask = np.zeros((bh, bw), dtype=np.uint8)
-                poly_offset = poly_pts - [x, y]
-                cv2.fillPoly(roi_mask, [poly_offset.astype(np.int32)], 255)
-                roi_mask = cv2.GaussianBlur(roi_mask, (7, 7), 0)
-                
-                alpha = (roi_mask.astype(float) / 255.0) * 0.85
-                alpha = cv2.merge([alpha, alpha, alpha])
-                
-                blended = (1.0 - alpha) * img[y:y+bh, x:x+bw].astype(float) + alpha * distorted_roi.astype(float)
-                img[y:y+bh, x:x+bw] = blended.astype(np.uint8)
+            mask = cv2.GaussianBlur(mask, (11, 11), 0)
             
-            # Fäden drüber zeichnen
+            # 3. Blending
+            alpha = (mask.astype(float) / 255.0) * 0.9
+            alpha = cv2.merge([alpha, alpha, alpha])
+            blended = (1.0 - alpha) * img.astype(float) + alpha * distorted.astype(float)
+            img = blended.astype(np.uint8)
+            
+            # 4. Fäden (immer oben auf)
             for idx in tips_idx:
                 p1, p2 = pts1[idx], pts2[idx]
-                cv2.line(img, p1, p2, (230, 255, 255), 1, cv2.LINE_AA)
+                cv2.line(img, p1, p2, (240, 255, 255), 1, cv2.LINE_AA)
 
     # Status
     cv2.rectangle(img, (0, 0), (w, 45), (30, 30, 30), cv2.FILLED)
