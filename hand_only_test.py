@@ -5,29 +5,53 @@ from mediapipe.tasks.python import vision
 import time
 import numpy as np
 import threading
+import queue
 
-# ── Shared State (Thread-Safe) ───────────────────────────────────────────────
+# ── Shared State ─────────────────────────────────────────────────────────────
 latest_result = None
 result_lock   = threading.Lock()
 
-def hand_result_callback(result, output_image, timestamp_ms):
-    global latest_result
-    with result_lock:
-        latest_result = result
+# Queue Größe 1: Nur der neueste Frame wird verarbeitet, ältere werden gedroppt
+frame_queue = queue.Queue(maxsize=1)
 
-# ── Hand Landmarker (LIVE_STREAM = async, nicht blockierend) ─────────────────
+# ── MediaPipe Worker Thread ───────────────────────────────────────────────────
 hand_options = vision.HandLandmarkerOptions(
     base_options=python.BaseOptions(model_asset_path='hand_landmarker.task'),
-    running_mode=vision.RunningMode.LIVE_STREAM,   # ← KEY: async callback
+    running_mode=vision.RunningMode.VIDEO,   # VIDEO-Modus im eigenen Thread
     num_hands=2,
     min_hand_detection_confidence=0.4,
     min_hand_presence_confidence=0.4,
     min_tracking_confidence=0.4,
-    result_callback=hand_result_callback
 )
 hand_detector = vision.HandLandmarker.create_from_options(hand_options)
 
-# ── Webcam (640x480 – reicht für MediaPipe, 4x weniger Pixel als 1280x720) ──
+def inference_worker():
+    global latest_result
+    last_ts = 0
+    while True:
+        try:
+            frame, ts_ms = frame_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if frame is None:   # Stoppsignal
+            break
+
+        # Streng monoton steigender Timestamp
+        if ts_ms <= last_ts:
+            ts_ms = last_ts + 1
+        last_ts = ts_ms
+
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_img  = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+        result  = hand_detector.detect_for_video(mp_img, ts_ms)
+
+        with result_lock:
+            latest_result = result
+
+worker = threading.Thread(target=inference_worker, daemon=True)
+worker.start()
+
+# ── Webcam ───────────────────────────────────────────────────────────────────
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -43,13 +67,12 @@ HAND_CONNECTIONS = [
     (5,9),(9,13),(13,17),
 ]
 
-start_time  = time.time()
-fps_timer   = time.time()
-fps         = 0
-fps_count   = 0
-last_ts     = 0
+start_time = time.time()
+fps_timer  = time.time()
+fps = 0
+fps_count = 0
 
-print("Hand-Tracking (LIVE_STREAM, optimiert) läuft... Drücke 'q' zum Beenden.")
+print("Hand-Tracking (threaded, kein Delay) läuft... Drücke 'q' zum Beenden.")
 
 while True:
     success, img = cap.read()
@@ -65,18 +88,19 @@ while True:
         fps_count = 0
         fps_timer = time.time()
 
-    # Timestamp muss streng monoton steigend sein
     ts_ms = int((time.time() - start_time) * 1000)
-    if ts_ms <= last_ts:
-        ts_ms = last_ts + 1
-    last_ts = ts_ms
 
-    # Async senden – kehrt sofort zurück, kein Warten!
-    img_rgb  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    mp_img   = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
-    hand_detector.detect_async(mp_img, ts_ms)
+    # Frame in Queue schieben – wenn voll, alten Frame rauswerfen (drop)
+    try:
+        frame_queue.put_nowait((img.copy(), ts_ms))
+    except queue.Full:
+        try:
+            frame_queue.get_nowait()   # alten Frame droppen
+        except queue.Empty:
+            pass
+        frame_queue.put_nowait((img.copy(), ts_ms))
 
-    # Letztes verfügbares Ergebnis holen (kann leicht veraltet sein – das ist okay)
+    # Letztes Ergebnis aus dem Worker holen
     with result_lock:
         result = latest_result
 
@@ -102,9 +126,11 @@ while True:
     cv2.putText(img, f"Haende: {nh}/2   FPS: {fps}",
                 (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
-    cv2.imshow("Hand-Tracking (optimiert)", img)
+    cv2.imshow("Hand-Tracking (threaded)", img)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
+# Worker sauber beenden
+frame_queue.put((None, 0))
 cap.release()
 cv2.destroyAllWindows()
