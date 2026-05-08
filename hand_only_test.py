@@ -47,7 +47,7 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 cap.set(cv2.CAP_PROP_FPS, 30)
 
-win_name = "Hand-Tracking (Segmented Heat)"
+win_name = "Hand-Tracking (Optimized Segments)"
 cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -70,9 +70,7 @@ while True:
     h, w, _ = img.shape
     fps_count += 1
     if time.time() - fps_timer >= 1.0:
-        fps = fps_count
-        fps_count = 0
-        fps_timer = time.time()
+        fps, fps_count, fps_timer = fps_count, 0, time.time()
 
     ts_ms = int((time.time() - start_time) * 1000)
     try: frame_queue.put_nowait((img.copy(), ts_ms))
@@ -98,34 +96,51 @@ while True:
             pts1, pts2 = np.array(all_hand_pts[0]), np.array(all_hand_pts[1])
             tips_idx = [4, 8, 12, 16, 20]
             
-            # 1. Globale Verzerrung vorbereiten (Noise/Waves)
-            distorted = img.copy()
-            t = time.time() * 25
-            for i in range(h):
-                off = int(14 * np.sin(2 * np.pi * i / 20 + t))
-                distorted[i] = np.roll(distorted[i], off, axis=0)
-            distorted = cv2.GaussianBlur(distorted, (9, 9), 0)
-
-            # 2. Segment-Maske erstellen (4 separate Vierecke zwischen den Fingern)
-            mask = np.zeros((h, w), dtype=np.uint8)
+            # 1. Bounding Box um alle Segmente berechnen
+            all_segments_pts = []
             for j in range(len(tips_idx) - 1):
                 idx_a, idx_b = tips_idx[j], tips_idx[j+1]
-                # Viereck zwischen Finger j und j+1 beider Hände
-                quad = np.array([pts1[idx_a], pts2[idx_a], pts2[idx_b], pts1[idx_b]], dtype=np.int32)
-                cv2.fillPoly(mask, [quad], 255)
+                all_segments_pts.extend([pts1[idx_a], pts2[idx_a], pts2[idx_b], pts1[idx_b]])
             
-            mask = cv2.GaussianBlur(mask, (11, 11), 0)
-            
-            # 3. Blending
-            alpha = (mask.astype(float) / 255.0) * 0.9
-            alpha = cv2.merge([alpha, alpha, alpha])
-            blended = (1.0 - alpha) * img.astype(float) + alpha * distorted.astype(float)
-            img = blended.astype(np.uint8)
-            
-            # 4. Fäden (immer oben auf)
+            x, y, bw, bh = cv2.boundingRect(np.array(all_segments_pts, dtype=np.int32))
+            x, y = max(0, x-10), max(0, y-10)
+            bw, bh = min(w - x, bw+20), min(h - y, bh+20)
+
+            if bw > 20 and bh > 20:
+                roi = img[y:y+bh, x:x+bw].copy()
+                
+                # 2. Vectorized Heat Haze (Schneller als np.roll in Loop)
+                # Wir nutzen cv2.remap für echte Verzerrung
+                flex_x = np.zeros((bh, bw), dtype=np.float32)
+                flex_y = np.zeros((bh, bw), dtype=np.float32)
+                t = time.time() * 20
+                for i in range(bh):
+                    flex_x[i, :] = np.arange(bw) + 12 * np.sin(2 * np.pi * (i+y) / 30 + t)
+                    flex_y[i, :] = np.arange(bh)[i]
+                
+                distorted_roi = cv2.remap(roi, flex_x, flex_y, cv2.INTER_LINEAR)
+                distorted_roi = cv2.GaussianBlur(distorted_roi, (5, 5), 0)
+
+                # 3. Maske nur für ROI
+                mask_roi = np.zeros((bh, bw), dtype=np.uint8)
+                for j in range(len(tips_idx) - 1):
+                    idx_a, idx_b = tips_idx[j], tips_idx[j+1]
+                    quad = np.array([pts1[idx_a], pts2[idx_a], pts2[idx_b], pts1[idx_b]], dtype=np.int32) - [x, y]
+                    cv2.fillPoly(mask_roi, [quad], 255)
+                
+                mask_roi = cv2.GaussianBlur(mask_roi, (11, 11), 0)
+                alpha = (mask_roi.astype(float) / 255.0) * 0.85
+                alpha = cv2.merge([alpha, alpha, alpha])
+                
+                # Blending auf ROI begrenzt
+                img_f = img[y:y+bh, x:x+bw].astype(float)
+                dist_f = distorted_roi.astype(float)
+                blended = (1.0 - alpha) * img_f + alpha * dist_f
+                img[y:y+bh, x:x+bw] = blended.astype(np.uint8)
+
+            # 4. Fäden
             for idx in tips_idx:
-                p1, p2 = pts1[idx], pts2[idx]
-                cv2.line(img, p1, p2, (240, 255, 255), 1, cv2.LINE_AA)
+                cv2.line(img, tuple(pts1[idx]), tuple(pts2[idx]), (240, 255, 255), 1, cv2.LINE_AA)
 
     # Status
     cv2.rectangle(img, (0, 0), (w, 45), (30, 30, 30), cv2.FILLED)
