@@ -10,14 +10,17 @@ import queue
 # ── Shared State ─────────────────────────────────────────────────────────────
 latest_result = None
 result_lock   = threading.Lock()
+frame_queue   = queue.Queue(maxsize=1)
 
-# Queue Größe 1: Nur der neueste Frame wird verarbeitet, ältere werden gedroppt
-frame_queue = queue.Queue(maxsize=1)
+def hand_result_callback(result, output_image, timestamp_ms):
+    global latest_result
+    with result_lock:
+        latest_result = result
 
 # ── MediaPipe Worker Thread ───────────────────────────────────────────────────
 hand_options = vision.HandLandmarkerOptions(
     base_options=python.BaseOptions(model_asset_path='hand_landmarker.task'),
-    running_mode=vision.RunningMode.VIDEO,   # VIDEO-Modus im eigenen Thread
+    running_mode=vision.RunningMode.VIDEO,
     num_hands=2,
     min_hand_detection_confidence=0.4,
     min_hand_presence_confidence=0.4,
@@ -33,10 +36,9 @@ def inference_worker():
             frame, ts_ms = frame_queue.get(timeout=1.0)
         except queue.Empty:
             continue
-        if frame is None:   # Stoppsignal
+        if frame is None:
             break
 
-        # Streng monoton steigender Timestamp
         if ts_ms <= last_ts:
             ts_ms = last_ts + 1
         last_ts = ts_ms
@@ -57,6 +59,11 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 cap.set(cv2.CAP_PROP_FPS, 30)
 
+# Window Setup für Fullscreen
+win_name = "Hand-Tracking (threaded)"
+cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
 HAND_COLORS = {"Left": (0, 165, 255), "Right": (255, 200, 0)}
 HAND_CONNECTIONS = [
     (0,1),(1,2),(2,3),(3,4),
@@ -72,7 +79,7 @@ fps_timer  = time.time()
 fps = 0
 fps_count = 0
 
-print("Hand-Tracking (threaded, kein Delay) läuft... Drücke 'q' zum Beenden.")
+print("Hand-Tracking (Fullscreen) läuft... Drücke 'q' zum Beenden.")
 
 while True:
     success, img = cap.read()
@@ -90,17 +97,15 @@ while True:
 
     ts_ms = int((time.time() - start_time) * 1000)
 
-    # Frame in Queue schieben – wenn voll, alten Frame rauswerfen (drop)
     try:
         frame_queue.put_nowait((img.copy(), ts_ms))
     except queue.Full:
         try:
-            frame_queue.get_nowait()   # alten Frame droppen
+            frame_queue.get_nowait()
         except queue.Empty:
             pass
         frame_queue.put_nowait((img.copy(), ts_ms))
 
-    # Letztes Ergebnis aus dem Worker holen
     with result_lock:
         result = latest_result
 
@@ -126,11 +131,10 @@ while True:
     cv2.putText(img, f"Haende: {nh}/2   FPS: {fps}",
                 (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
-    cv2.imshow("Hand-Tracking (threaded)", img)
+    cv2.imshow(win_name, img)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# Worker sauber beenden
 frame_queue.put((None, 0))
 cap.release()
 cv2.destroyAllWindows()
