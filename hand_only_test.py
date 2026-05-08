@@ -15,7 +15,7 @@ frame_queue   = queue.Queue(maxsize=1)
 # Status Variablen
 hand_primed = [False, False]
 last_prime_time = [0, 0]
-prime_middle_wrist_dist = [0, 0] # Um die Richtung zu prüfen
+prime_middle_wrist_dist = [0, 0] # Um Richtung zu prüfen
 heat_haze_enabled = True
 
 # Clap Detection State
@@ -103,33 +103,24 @@ while True:
             pts = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
             all_hand_pts.append(pts)
             
-            # --- VERBESSERTE SCHNIPS-ERKENNUNG ---
+            # Verbesserte Snap Detection mit Richtungs-Check
             hand_size = np.sqrt((lms[0].x - lms[9].x)**2 + (lms[0].y - lms[9].y)**2)
             dist_thumb_middle = np.sqrt((lms[4].x - lms[12].x)**2 + (lms[4].y - lms[12].y)**2)
             dist_middle_wrist = np.sqrt((lms[12].x - lms[0].x)**2 + (lms[12].y - lms[0].y)**2)
             
-            # Phase 1: Priming (Daumen & Mittelfinger nah beieinander)
-            if dist_thumb_middle < 0.16 * hand_size:
+            if dist_thumb_middle < 0.18 * hand_size:
                 hand_primed[i] = True
                 last_prime_time[i] = curr_t
-                prime_middle_wrist_dist[i] = dist_middle_wrist
-            
-            # Phase 2: Snap Trigger
-            elif hand_primed[i]:
-                # Ein Schnipser muss SCHNELL sein (< 0.3s)
-                # UND der Mittelfinger muss sich RIchtung Handfläche/Wrist bewegen
-                # (dist_middle_wrist wird kleiner oder bleibt gleich, während dist_thumb_middle explodiert)
-                if dist_thumb_middle > 0.65 * hand_size:
-                    dt = curr_t - last_prime_time[i]
-                    # Nur wenn der Mittelfinger nicht weit weg geflogen ist (relative zum Wrist)
-                    if dt < 0.35 and dist_middle_wrist <= prime_middle_wrist_dist[i] + 0.1 * hand_size:
+                prime_middle_wrist_dist[i] = dist_middle_wrist # Referenz-Abstand beim Drücken
+            elif hand_primed[i] and dist_thumb_middle > 0.6 * hand_size:
+                # RICHTUNGS-CHECK: Der Mittelfinger muss jetzt NÄHER am Handgelenk sein als beim Primen
+                # (oder zumindest nicht viel weiter weg - beim Öffnen vergrößert sich der Abstand massiv)
+                if curr_t - last_prime_time[i] < 0.4:
+                    if dist_middle_wrist < prime_middle_wrist_dist[i] * 1.1:
                         heat_haze_enabled = not heat_haze_enabled
-                    hand_primed[i] = False
-            
-            # Auto-Reset
-            if hand_primed[i] and curr_t - last_prime_time[i] > 0.5:
                 hand_primed[i] = False
-            # -------------------------------------
+            
+            if hand_primed[i] and curr_t - last_prime_time[i] > 0.5: hand_primed[i] = False
 
             color = HAND_COLORS.get(result.handedness[i][0].display_name if result.handedness else "?", (200, 200, 200))
             for a, b in HAND_CONNECTIONS: cv2.line(overlay, pts[a], pts[b], color, 1)
@@ -141,9 +132,8 @@ while True:
             p1, p2 = result.hand_landmarks[0][9], result.hand_landmarks[1][9]
             dist = np.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2)
             if dist < 0.12 and last_palm_dist > 0.25 and curr_t > clap_cooldown:
-                clap_explosion_until = curr_t + 0.6
+                clap_explosion_until, clap_cooldown = curr_t + 0.6, curr_t + 1.0
                 clap_explosion_pos = (int((p1.x + p2.x)/2 * w), int((p1.y + p2.y)/2 * h))
-                clap_cooldown = curr_t + 1.0
             last_palm_dist = dist
 
         # Heat Haze
@@ -174,10 +164,10 @@ while True:
                 img[y:y+bh, x:x+bw] = ((1.0 - alpha) * img[y:y+bh, x:x+bw].astype(float) + alpha * distorted_roi.astype(float)).astype(np.uint8)
             for idx in tips_idx: cv2.line(img, tuple(pts1[idx]), tuple(pts2[idx]), (240, 255, 255), 1, cv2.LINE_AA)
 
-    # Schockwelle
+    # Explosion
     if curr_t < clap_explosion_until:
         rem = clap_explosion_until - curr_t
-        radius, alpha = int(120 * (1.0 - rem/0.6)), rem / 0.6
+        radius, alpha = int(120 * (1.0 - rem/0.6)), rem/0.6
         ov = img.copy()
         cv2.circle(ov, clap_explosion_pos, radius, (255, 255, 255), 3)
         cv2.circle(ov, clap_explosion_pos, int(radius/2), (255, 255, 255), -1)
