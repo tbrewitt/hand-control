@@ -15,14 +15,20 @@ frame_queue   = queue.Queue(maxsize=1)
 # Status Variablen
 hand_primed = [False, False]
 last_prime_time = [0, 0]
-prime_middle_wrist_dist = [0, 0] # Um Richtung zu prüfen
+prime_middle_wrist_dist = [0, 0]
 heat_haze_enabled = True
 
-# Clap Detection State
+# Clap & Push State
 last_palm_dist = 1.0
 clap_explosion_until = 0
 clap_explosion_pos = (0, 0)
 clap_cooldown = 0
+
+# Push (Stoß) Detection
+last_z = [0.0, 0.0]
+push_shockwave_until = 0
+push_origin = (0, 0)
+push_cooldown = 0
 
 # ── MediaPipe Worker Thread ───────────────────────────────────────────────────
 hand_options = vision.HandLandmarkerOptions(
@@ -59,7 +65,7 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH,  320)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 cap.set(cv2.CAP_PROP_FPS, 30)
 
-win_name = "Hand-Tracking (Pro Snap & Clap)"
+win_name = "Hand-Control: Force Push"
 cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -93,7 +99,7 @@ while True:
 
     with result_lock: result = latest_result
 
-    # ── Logik ────────────────────────────────────────────────────────────────
+    # ── Logik & Effekte ──────────────────────────────────────────────────────
     all_hand_pts = []
     curr_t = time.time()
     
@@ -103,31 +109,37 @@ while True:
             pts = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
             all_hand_pts.append(pts)
             
-            # Verbesserte Snap Detection mit Richtungs-Check
+            # 1. Snap Logic (Toggle)
             hand_size = np.sqrt((lms[0].x - lms[9].x)**2 + (lms[0].y - lms[9].y)**2)
-            dist_thumb_middle = np.sqrt((lms[4].x - lms[12].x)**2 + (lms[4].y - lms[12].y)**2)
-            dist_middle_wrist = np.sqrt((lms[12].x - lms[0].x)**2 + (lms[12].y - lms[0].y)**2)
+            d_tm = np.sqrt((lms[4].x - lms[12].x)**2 + (lms[4].y - lms[12].y)**2)
+            d_mw = np.sqrt((lms[12].x - lms[0].x)**2 + (lms[12].y - lms[0].y)**2)
             
-            if dist_thumb_middle < 0.18 * hand_size:
-                hand_primed[i] = True
-                last_prime_time[i] = curr_t
-                prime_middle_wrist_dist[i] = dist_middle_wrist # Referenz-Abstand beim Drücken
-            elif hand_primed[i] and dist_thumb_middle > 0.6 * hand_size:
-                # RICHTUNGS-CHECK: Der Mittelfinger muss jetzt NÄHER am Handgelenk sein als beim Primen
-                # (oder zumindest nicht viel weiter weg - beim Öffnen vergrößert sich der Abstand massiv)
-                if curr_t - last_prime_time[i] < 0.4:
-                    if dist_middle_wrist < prime_middle_wrist_dist[i] * 1.1:
-                        heat_haze_enabled = not heat_haze_enabled
+            if d_tm < 0.18 * hand_size:
+                hand_primed[i], last_prime_time[i] = True, curr_t
+                prime_middle_wrist_dist[i] = d_mw
+            elif hand_primed[i] and d_tm > 0.6 * hand_size:
+                if curr_t - last_prime_time[i] < 0.4 and d_mw < prime_middle_wrist_dist[i] * 1.1:
+                    heat_haze_enabled = not heat_haze_enabled
                 hand_primed[i] = False
-            
             if hand_primed[i] and curr_t - last_prime_time[i] > 0.5: hand_primed[i] = False
+
+            # 2. Force Push Detection (Z-Achsen Geschwindigkeit)
+            z_curr = lms[9].z # Palm center depth
+            dz = z_curr - last_z[i]
+            # Wenn Hand flach offen ist (Fingerspitzen weit weg von Handgelenk)
+            is_open = lms[8].y < lms[6].y and lms[12].y < lms[10].y
+            if dz < -0.06 and is_open and curr_t > push_cooldown: # dz < 0 heißt näher zur Kamera
+                push_shockwave_until = curr_t + 0.8
+                push_origin = (int(lms[9].x * w), int(lms[9].y * h))
+                push_cooldown = curr_t + 1.0
+            last_z[i] = z_curr
 
             color = HAND_COLORS.get(result.handedness[i][0].display_name if result.handedness else "?", (200, 200, 200))
             for a, b in HAND_CONNECTIONS: cv2.line(overlay, pts[a], pts[b], color, 1)
             for pt in pts: cv2.circle(overlay, pt, 1, (255, 255, 255), cv2.FILLED)
         cv2.addWeighted(overlay, 0.7, img, 0.3, 0, img)
 
-        # Clap Detection
+        # 3. Clap Detection
         if len(all_hand_pts) == 2:
             p1, p2 = result.hand_landmarks[0][9], result.hand_landmarks[1][9]
             dist = np.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2)
@@ -136,42 +148,55 @@ while True:
                 clap_explosion_pos = (int((p1.x + p2.x)/2 * w), int((p1.y + p2.y)/2 * h))
             last_palm_dist = dist
 
-        # Heat Haze
+        # 4. Heat Haze
         if heat_haze_enabled and len(all_hand_pts) == 2:
             pts1, pts2 = np.array(all_hand_pts[0]), np.array(all_hand_pts[1])
             tips_idx = [4, 8, 12, 16, 20]
             all_tips = []
             for j in range(len(tips_idx)-1):
                 all_tips.extend([pts1[tips_idx[j]], pts2[tips_idx[j]], pts2[tips_idx[j+1]], pts1[tips_idx[j+1]]])
-            x, y, bw, bh = cv2.boundingRect(np.array(all_tips, dtype=np.int32))
-            x, y, bw, bh = max(0, x-15), max(0, y-15), min(w-x, bw+30), min(h-y, bh+30)
+            x_b, y_b, bw, bh = cv2.boundingRect(np.array(all_tips, dtype=np.int32))
+            x_b, y_b, bw, bh = max(0, x_b-15), max(0, y_b-15), min(w-x_b, bw+30), min(h-y_b, bh+30)
             if bw > 5 and bh > 5:
-                roi = img[y:y+bh, x:x+bw].copy()
-                distorted_roi = roi.copy()
-                t_wave = time.time() * 30
+                roi = img[y_b:y_b+bh, x_b:x_b+bw].copy()
+                dist_roi = roi.copy()
+                t_w = curr_t * 30
                 for r in range(bh):
-                    offset = int(16 * np.sin(2 * np.pi * (r+y) / 12 + t_wave))
-                    distorted_roi[r] = np.roll(roi[r], offset, axis=0)
-                distorted_roi = cv2.GaussianBlur(distorted_roi, (9, 9), 0)
-                mask_roi = np.zeros((bh, bw), dtype=np.uint8)
+                    off = int(16 * np.sin(2 * np.pi * (r+y_b) / 12 + t_w))
+                    dist_roi[r] = np.roll(roi[r], off, axis=0)
+                dist_roi = cv2.GaussianBlur(dist_roi, (9, 9), 0)
+                mask = np.zeros((bh, bw), dtype=np.uint8)
                 for j in range(len(tips_idx) - 1):
-                    idx_a, idx_b = tips_idx[j], tips_idx[j+1]
-                    quad = np.array([pts1[idx_a], pts2[idx_a], pts2[idx_b], pts1[idx_b]], dtype=np.int32) - [x, y]
-                    cv2.fillPoly(mask_roi, [quad], 255)
-                mask_roi = cv2.GaussianBlur(mask_roi, (11, 11), 0)
-                alpha = (mask_roi.astype(float) / 255.0) * 0.9
+                    quad = np.array([pts1[tips_idx[j]], pts2[tips_idx[j]], pts2[tips_idx[j+1]], pts1[tips_idx[j+1]]], dtype=np.int32) - [x_b, y_b]
+                    cv2.fillPoly(mask, [quad], 255)
+                mask = cv2.GaussianBlur(mask, (11, 11), 0)
+                alpha = (mask.astype(float) / 255.0) * 0.9
                 alpha = cv2.merge([alpha, alpha, alpha])
-                img[y:y+bh, x:x+bw] = ((1.0 - alpha) * img[y:y+bh, x:x+bw].astype(float) + alpha * distorted_roi.astype(float)).astype(np.uint8)
-            for idx in tips_idx: cv2.line(img, tuple(pts1[idx]), tuple(pts2[idx]), (240, 255, 255), 1, cv2.LINE_AA)
+                img[y_b:y_b+bh, x_b:x_b+bw] = ((1.0 - alpha) * img[y_b:y_b+bh, x_b:x_b+bw].astype(float) + alpha * dist_roi.astype(float)).astype(np.uint8)
 
-    # Explosion
+    # ── Visuelle Overlays ──
+    # A. Clap Explosion
     if curr_t < clap_explosion_until:
         rem = clap_explosion_until - curr_t
-        radius, alpha = int(120 * (1.0 - rem/0.6)), rem/0.6
+        rad, alp = int(120 * (1.0 - rem/0.6)), rem/0.6
         ov = img.copy()
-        cv2.circle(ov, clap_explosion_pos, radius, (255, 255, 255), 3)
-        cv2.circle(ov, clap_explosion_pos, int(radius/2), (255, 255, 255), -1)
-        cv2.addWeighted(ov, alpha, img, 1.0 - alpha, 0, img)
+        cv2.circle(ov, clap_explosion_pos, rad, (255, 255, 255), 3)
+        cv2.circle(ov, clap_explosion_pos, int(rad/2), (255, 255, 255), -1)
+        cv2.addWeighted(ov, alp, img, 1.0 - alp, 0, img)
+
+    # B. Force Push Shockwave (Warp-Effekt)
+    if curr_t < push_shockwave_until:
+        rem = push_shockwave_until - curr_t
+        # Wachsender Ring der Verzerrung
+        prog = 1.0 - (rem / 0.8)
+        radius = int(prog * w * 1.5)
+        alp = (rem / 0.8) * 0.7
+        
+        # Simpler visueller Ring (Warp ist zu schwer für CPU hier, daher ein "Glow-Ring")
+        ov = img.copy()
+        cv2.circle(ov, push_origin, radius, (255, 255, 200), 15)
+        cv2.circle(ov, push_origin, radius + 10, (255, 255, 255), 2)
+        cv2.addWeighted(ov, alp, img, 1.0 - alp, 0, img)
 
     # UI Banner
     status_color = (0, 255, 0) if heat_haze_enabled else (0, 0, 255)
